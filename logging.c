@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 
+#include <string.h>
 #include <time.h>
 #include <assert.h>
 
@@ -20,11 +21,139 @@ struct LogContext {
     LogPolicy *lp;
     Conf *conf;
     int logtype;                       /* cached out of conf */
+
+    /* Filtering + per-line timestamp state (used for human-readable logs). */
+    bool ts_at_line_start;             /* write timestamp before next output */
+    bool pending_cr;                   /* saw '\r', waiting to see if next is '\n' */
+    unsigned char ansi_state;          /* enum LogAnsiState */
+    bool osc_esc_seen;                 /* within OSC: saw ESC (waiting for '\') */
 };
 
 static Filename *xlatlognam(const Filename *s,
                             const char *hostname, int port,
                             const struct tm *tm);
+
+enum LogAnsiState {
+    ANSI_NORMAL = 0,
+    ANSI_ESC,
+    ANSI_CSI,
+    ANSI_OSC,
+};
+
+static size_t format_timestamp(char *dst, size_t cap)
+{
+    struct tm tm = ltime();
+    return strftime(dst, cap, "[%Y-%m-%d %H:%M:%S] ", &tm);
+}
+
+static bool fwrite_all(FILE *fp, const void *buf, size_t len)
+{
+    return len == 0 || fwrite(buf, 1, len, fp) == len;
+}
+
+static bool logwrite_processed(LogContext *ctx, ptrlen data)
+{
+    const unsigned char *p = (const unsigned char *)data.ptr;
+
+    unsigned char out[4096];
+    size_t outlen = 0;
+
+#define FLUSH_OUT() do {                                                     \
+        if (outlen && !fwrite_all(ctx->lgfp, out, outlen))                   \
+            return false;                                                    \
+        outlen = 0;                                                         \
+    } while (0)
+
+#define EMIT_BYTE(ch_) do {                                                  \
+        if (ctx->ts_at_line_start) {                                         \
+            char ts[64];                                                     \
+            size_t tslen = format_timestamp(ts, sizeof(ts));                 \
+            if (tslen) {                                                     \
+                if (outlen + tslen > sizeof(out))                            \
+                    FLUSH_OUT();                                             \
+                memcpy(out + outlen, ts, tslen);                             \
+                outlen += tslen;                                             \
+            }                                                                \
+            ctx->ts_at_line_start = false;                                   \
+        }                                                                    \
+        if (outlen == sizeof(out))                                           \
+            FLUSH_OUT();                                                     \
+        out[outlen++] = (unsigned char)(ch_);                                \
+        if ((ch_) == '\n')                                                   \
+            ctx->ts_at_line_start = true;                                    \
+    } while (0)
+
+    for (size_t i = 0; i < data.len; i++) {
+        unsigned char ch = p[i];
+
+        if (ctx->pending_cr) {
+            ctx->pending_cr = false;
+            if (ch == '\n') {
+                /* CRLF -> LF */
+                EMIT_BYTE('\n');
+                continue;
+            }
+            /* Lone CR policy: drop it and continue processing this byte. */
+        }
+
+        if (ch == '\r') {
+            ctx->pending_cr = true;
+            continue;
+        }
+
+        switch (ctx->ansi_state) {
+        case ANSI_NORMAL:
+            if (ch == 0x1B) { /* ESC */
+                ctx->ansi_state = ANSI_ESC;
+                continue;
+            }
+            break;
+
+        case ANSI_ESC:
+            if (ch == '[') {
+                ctx->ansi_state = ANSI_CSI;
+                continue;
+            }
+            if (ch == ']') {
+                ctx->ansi_state = ANSI_OSC;
+                ctx->osc_esc_seen = false;
+                continue;
+            }
+            ctx->ansi_state = ANSI_NORMAL;
+            continue;
+
+        case ANSI_CSI:
+            if (ch >= 0x40 && ch <= 0x7E)
+                ctx->ansi_state = ANSI_NORMAL;
+            continue;
+
+        case ANSI_OSC:
+            if (ctx->osc_esc_seen) {
+                if (ch == '\\')
+                    ctx->ansi_state = ANSI_NORMAL;
+                ctx->osc_esc_seen = false;
+                continue;
+            }
+            if (ch == 0x07) { /* BEL */
+                ctx->ansi_state = ANSI_NORMAL;
+                continue;
+            }
+            if (ch == 0x1B) {
+                ctx->osc_esc_seen = true;
+                continue;
+            }
+            continue;
+        }
+
+        EMIT_BYTE(ch);
+    }
+
+    FLUSH_OUT();
+
+#undef EMIT_BYTE
+#undef FLUSH_OUT
+    return true;
+}
 
 /*
  * Internal wrapper function which must be called for _all_ output
@@ -45,8 +174,14 @@ static void logwrite(LogContext *ctx, ptrlen data)
     if (ctx->state == L_OPENING) {
         bufchain_add(&ctx->queue, data.ptr, data.len);
     } else if (ctx->state == L_OPEN) {
+        bool ok;
         assert(ctx->lgfp);
-        if (fwrite(data.ptr, 1, data.len, ctx->lgfp) < data.len) {
+        if (ctx->logtype == LGTYP_ASCII || ctx->logtype == LGTYP_DEBUG) {
+            ok = logwrite_processed(ctx, data);
+        } else {
+            ok = fwrite_all(ctx->lgfp, data.ptr, data.len);
+        }
+        if (!ok) {
             logfclose(ctx);
             ctx->state = L_ERROR;
             lp_eventlog(ctx->lp, "Disabled writing session log "
@@ -94,6 +229,7 @@ static void logfopen_callback(void *vctx, int mode)
     struct tm tm;
     const char *fmode;
     bool shout = false;
+    bool ok = true;
 
     if (mode == 0) {
         ctx->state = L_ERROR;          /* disable logging */
@@ -110,10 +246,38 @@ static void logfopen_callback(void *vctx, int mode)
 
     if (ctx->state == L_OPEN && conf_get_bool(ctx->conf, CONF_logheader)) {
         /* Write header line into log file. */
+        char header[512];
+        int header_len_int;
+        size_t header_len;
         tm = ltime();
         strftime(buf, 24, "%Y.%m.%d %H:%M:%S", &tm);
-        logprintf(ctx, "=~=~=~=~=~=~=~=~=~=~=~= PuTTY log %s"
-                  " =~=~=~=~=~=~=~=~=~=~=~=\r\n", buf);
+        header_len_int = snprintf(header, sizeof(header),
+                                  "=~=~=~=~=~=~=~=~=~=~=~= PuTTY log %s"
+                                  " =~=~=~=~=~=~=~=~=~=~=~=\r\n",
+                                  buf);
+        header_len = header_len_int < 0 ? 0 : (size_t)header_len_int;
+        if (header_len >= sizeof(header))
+            header_len = sizeof(header) - 1;
+        ok = fwrite_all(ctx->lgfp, header, header_len);
+    }
+
+    if (ctx->state == L_OPEN && ok) {
+        /*
+         * Reset per-stream parsing state for a fresh log file. Do this
+         * after writing the optional header, so the header itself isn't
+         * affected by timestamping or filtering.
+         */
+        ctx->ts_at_line_start = true;
+        ctx->pending_cr = false;
+        ctx->ansi_state = ANSI_NORMAL;
+        ctx->osc_esc_seen = false;
+    }
+
+    if (ctx->state == L_OPEN && !ok) {
+        logfclose(ctx);
+        ctx->state = L_ERROR;
+        lp_eventlog(ctx->lp, "Disabled writing session log "
+                    "due to error while writing");
     }
 
     event = dupprintf("%s session log (%s mode) to file: %s",
@@ -389,6 +553,12 @@ LogContext *log_init(LogPolicy *lp, Conf *conf)
     ctx->logtype = conf_get_int(ctx->conf, CONF_logtype);
     ctx->currlogfilename = NULL;
     bufchain_init(&ctx->queue);
+
+    ctx->ts_at_line_start = true;
+    ctx->pending_cr = false;
+    ctx->ansi_state = ANSI_NORMAL;
+    ctx->osc_esc_seen = false;
+
     return ctx;
 }
 
