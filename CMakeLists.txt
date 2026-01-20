@@ -171,6 +171,11 @@ add_executable(test_conf
 be_list(test_conf TestConf SSH SERIAL OTHERBACKENDS)
 target_link_libraries(test_conf sshclient otherbackends settings network crypto utils ${platform_libraries})
 
+add_executable(test_sessionlog_processing
+  test/logging/test_sessionlog_processing.c
+  $<TARGET_OBJECTS:logging>)
+target_link_libraries(test_sessionlog_processing utils settings ${platform_libraries})
+
 foreach(subdir ${platform} ${extra_dirs})
   add_subdirectory(${subdir})
 endforeach()
