@@ -9,6 +9,8 @@ build.ninja
 CMakeFiles/
 Debug/
 Win32/
+build/
+build-relwithdebuginfo/
 cmake_install.cmake
 /shipped.txt
 *.dir/
