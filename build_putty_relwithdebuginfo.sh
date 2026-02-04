@@ -10,7 +10,7 @@ Builds PuTTY from ./PuTTY using CMake with CMAKE_BUILD_TYPE=RelWithDebInfo.
 Defaults:
   --build-dir  PuTTY/build-relwithdebuginfo
   --jobs       nproc
-  --target     putty --target pterm
+  --target     all
 
 Examples:
   ./build_putty_relwithdebuginfo.sh
@@ -100,8 +100,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ${#targets[@]} -eq 0 ]]; then
-  targets=(putty pterm)
-  targets_were_default=1
+  build_all=1
+else
+  build_all=0
 fi
 
 command -v cmake >/dev/null 2>&1 || { echo "fail: cmake not found in PATH" >&2; exit 2; }
@@ -131,39 +132,32 @@ run_cmake_filtered cmake "${generator_args[@]}" \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
-available_targets=""
-if [[ -f "${build_dir}/build.ninja" ]] && command -v ninja >/dev/null 2>&1; then
-  available_targets="$(ninja -C "${build_dir}" -t targets all 2>/dev/null || true)"
-else
-  available_targets="$(run_cmake_filtered cmake --build "${build_dir}" --target help)"
-fi
-declare -a missing_targets=()
-declare -a present_targets=()
-for t in "${targets[@]}"; do
-  if target_is_available "${available_targets}" "${t}"; then
-    present_targets+=("${t}")
-  else
-    missing_targets+=("${t}")
-  fi
-done
-
-build_all=0
-if [[ ${#missing_targets[@]} -ne 0 ]]; then
-  if [[ "${targets_were_default}" -eq 1 ]]; then
-    echo "warn: default targets not available: ${missing_targets[*]}" >&2
-    echo "      building default 'all' target instead" >&2
-    build_all=1
-  else
-    echo "fail: requested targets not available: ${missing_targets[*]}" >&2
-    echo "      run: cmake --build \"${build_dir}\" --target help" >&2
-    exit 2
-  fi
-fi
-
 if [[ "${build_all}" -eq 1 ]]; then
   run_cmake_filtered cmake --build "${build_dir}" -- -j "${jobs}"
   echo "built default target: all"
 else
+  available_targets=""
+  if [[ -f "${build_dir}/build.ninja" ]] && command -v ninja >/dev/null 2>&1; then
+    available_targets="$(ninja -C "${build_dir}" -t targets all 2>/dev/null || true)"
+  else
+    available_targets="$(run_cmake_filtered cmake --build "${build_dir}" --target help)"
+  fi
+  declare -a missing_targets=()
+  declare -a present_targets=()
+  for t in "${targets[@]}"; do
+    if target_is_available "${available_targets}" "${t}"; then
+      present_targets+=("${t}")
+    else
+      missing_targets+=("${t}")
+    fi
+  done
+
+  if [[ ${#missing_targets[@]} -ne 0 ]]; then
+    echo "fail: requested targets not available: ${missing_targets[*]}" >&2
+    echo "      run: cmake --build \"${build_dir}\" --target help" >&2
+    exit 2
+  fi
+
   targets=("${present_targets[@]}")
   run_cmake_filtered cmake --build "${build_dir}" --target "${targets[@]}" -- -j "${jobs}"
   echo "built targets: ${targets[*]}"
